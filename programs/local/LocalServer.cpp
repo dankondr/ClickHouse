@@ -1,53 +1,56 @@
 #include "LocalServer.h"
 
-#include <Poco/Util/XMLConfiguration.h>
-#include <Poco/Util/HelpFormatter.h>
-#include <Poco/Util/OptionCallback.h>
-#include <Poco/String.h>
-#include <Poco/Logger.h>
-#include <Poco/NullChannel.h>
-#include <Databases/DatabaseMemory.h>
-#include <Storages/System/attachSystemTables.h>
-#include <Interpreters/ProcessList.h>
-#include <Interpreters/executeQuery.h>
-#include <Interpreters/loadMetadata.h>
-#include <Interpreters/DatabaseCatalog.h>
-#include <Common/Exception.h>
-#include <Common/Macros.h>
-#include <Common/Config/ConfigProcessor.h>
-#include <Common/escapeForFileName.h>
-#include <Common/ClickHouseRevision.h>
-#include <Common/ThreadStatus.h>
-#include <Common/config_version.h>
-#include <Common/quoteString.h>
-#include <IO/ReadBufferFromFile.h>
-#include <IO/ReadBufferFromString.h>
-#include <IO/WriteBufferFromFileDescriptor.h>
-#include <IO/UseSSL.h>
-#include <IO/ReadHelpers.h>
-#include <Parsers/parseQuery.h>
-#include <Parsers/IAST.h>
-#include <common/ErrorHandlers.h>
-#include <Common/StatusFile.h>
-#include <Functions/registerFunctions.h>
 #include <AggregateFunctions/registerAggregateFunctions.h>
-#include <TableFunctions/registerTableFunctions.h>
-#include <Storages/registerStorages.h>
+#include <Databases/DatabaseMemory.h>
 #include <Dictionaries/registerDictionaries.h>
 #include <Disks/registerDisks.h>
 #include <Formats/registerFormats.h>
-#include <boost/program_options/options_description.hpp>
+#include <Functions/registerFunctions.h>
+#include <IO/ReadBufferFromFile.h>
+#include <IO/ReadBufferFromString.h>
+#include <IO/ReadHelpers.h>
+#include <IO/UseSSL.h>
+#include <IO/WriteBufferFromFileDescriptor.h>
+#include <Interpreters/DatabaseCatalog.h>
+#include <Interpreters/ProcessList.h>
+#include <Interpreters/executeQuery.h>
+#include <Interpreters/loadMetadata.h>
+#include <Parsers/IAST.h>
+#include <Parsers/parseQuery.h>
+#include <Storages/System/attachSystemTables.h>
+#include <Storages/registerStorages.h>
+#include <TableFunctions/registerTableFunctions.h>
 #include <boost/program_options.hpp>
-#include <common/argsToConfig.h>
+#include <boost/program_options/options_description.hpp>
+#include <Poco/Logger.h>
+#include <Poco/NullChannel.h>
+#include <Poco/String.h>
+#include <Poco/Util/HelpFormatter.h>
+#include <Poco/Util/OptionCallback.h>
+#include <Poco/Util/XMLConfiguration.h>
+#include <Common/ClickHouseRevision.h>
+#include <Common/Config/ConfigProcessor.h>
+#include <Common/Exception.h>
+#include <Common/Macros.h>
+#include <Common/StatusFile.h>
 #include <Common/TerminalSize.h>
+#include <Common/ThreadStatus.h>
+#include <Common/UnicodeBar.h>
+#include <Common/config_version.h>
+#include <Common/escapeForFileName.h>
+#include <Common/quoteString.h>
 #include <Common/randomSeed.h>
+#include <common/ErrorHandlers.h>
+#include <common/argsToConfig.h>
 
 #include <filesystem>
 
 
+/// http://en.wikipedia.org/wiki/ANSI_escape_code
+#define CLEAR_TO_END_OF_LINE "\033[K"
+
 namespace DB
 {
-
 namespace ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
@@ -117,7 +120,8 @@ void LocalServer::tryInitPath()
 
         if (path.empty())
         {
-            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            throw Exception(
+                ErrorCodes::BAD_ARGUMENTS,
                 "Cannot work with empty storage path that is explicitly specified"
                 " by the --path option. Please check the program options and"
                 " correct the --path.");
@@ -135,9 +139,8 @@ void LocalServer::tryInitPath()
         {
             // try to guess a tmp folder name, and check if it's a directory (throw exception otherwise)
             parent_folder = std::filesystem::temp_directory_path();
-
         }
-        catch (const std::filesystem::filesystem_error& e)
+        catch (const std::filesystem::filesystem_error & e)
         {
             // tmp folder don't exists? misconfiguration? chroot?
             LOG_DEBUG(log, "Can not get temporary folder: {}", e.what());
@@ -155,7 +158,8 @@ void LocalServer::tryInitPath()
         default_path = parent_folder / fmt::format("clickhouse-local-{}-{}-{}", getpid(), time(nullptr), randomSeed());
 
         if (exists(default_path))
-            throw Exception(ErrorCodes::FILE_ALREADY_EXISTS, "Unsuccessful attempt to create working directory: {} exist!", default_path.string());
+            throw Exception(
+                ErrorCodes::FILE_ALREADY_EXISTS, "Unsuccessful attempt to create working directory: {} exist!", default_path.string());
 
         create_directory(default_path);
         temporary_directory_to_delete = default_path;
@@ -336,12 +340,12 @@ std::string LocalServer::getInitialCreateTableQuery()
     else /// Use regular file
         table_file = quoteString(config().getString("table-file"));
 
-    return
-    "CREATE TABLE " + table_name +
-        " (" + table_structure + ") " +
-    "ENGINE = "
-        "File(" + data_format + ", " + table_file + ")"
-    "; ";
+    return "CREATE TABLE " + table_name + " (" + table_structure + ") "
+        + "ENGINE = "
+          "File("
+        + data_format + ", " + table_file
+        + ")"
+          "; ";
 }
 
 
@@ -382,11 +386,24 @@ void LocalServer::processQueries()
     /// Use the same query_id (and thread group) for all queries
     CurrentThread::QueryScope query_scope_holder(context);
 
+    context.setProgressCallback([this](const Progress &value){
+        this->updateProgress(value);
+        this->writeProgress();
+        return true;
+    });
+
     bool echo_queries = config().hasOption("echo") || config().hasOption("verbose");
     std::exception_ptr exception;
 
     for (const auto & query : queries)
     {
+        watch.restart();
+        progress.reset();
+        show_progress_bar = false;
+        written_progress_chars = 0;
+        written_first_block = false;
+
+
         ReadBufferFromString read_buf(query);
         WriteBufferFromFileDescriptor write_buf(STDOUT_FILENO);
 
@@ -417,30 +434,29 @@ void LocalServer::processQueries()
         std::rethrow_exception(exception);
 }
 
-static const char * minimal_default_user_xml =
-"<yandex>"
-"    <profiles>"
-"        <default></default>"
-"    </profiles>"
-"    <users>"
-"        <default>"
-"            <password></password>"
-"            <networks>"
-"                <ip>::/0</ip>"
-"            </networks>"
-"            <profile>default</profile>"
-"            <quota>default</quota>"
-"        </default>"
-"    </users>"
-"    <quotas>"
-"        <default></default>"
-"    </quotas>"
-"</yandex>";
+static const char * minimal_default_user_xml = "<yandex>"
+                                               "    <profiles>"
+                                               "        <default></default>"
+                                               "    </profiles>"
+                                               "    <users>"
+                                               "        <default>"
+                                               "            <password></password>"
+                                               "            <networks>"
+                                               "                <ip>::/0</ip>"
+                                               "            </networks>"
+                                               "            <profile>default</profile>"
+                                               "            <quota>default</quota>"
+                                               "        </default>"
+                                               "    </users>"
+                                               "    <quotas>"
+                                               "        <default></default>"
+                                               "    </quotas>"
+                                               "</yandex>";
 
 
 static ConfigurationPtr getConfigurationFromXMLString(const char * xml_data)
 {
-    std::stringstream ss{std::string{xml_data}};    // STYLE_CHECK_ALLOW_STD_STRING_STREAM
+    std::stringstream ss{std::string{xml_data}}; // STYLE_CHECK_ALLOW_STD_STRING_STREAM
     Poco::XML::InputSource input_source{ss};
     return {new Poco::Util::XMLConfiguration{&input_source}};
 }
@@ -488,27 +504,25 @@ static void showClientVersion()
 
 static std::string getHelpHeader()
 {
-    return
-        "usage: clickhouse-local [initial table definition] [--query <query>]\n"
+    return "usage: clickhouse-local [initial table definition] [--query <query>]\n"
 
-        "clickhouse-local allows to execute SQL queries on your data files via single command line call."
-        " To do so, initially you need to define your data source and its format."
-        " After you can execute your SQL queries in usual manner.\n"
+           "clickhouse-local allows to execute SQL queries on your data files via single command line call."
+           " To do so, initially you need to define your data source and its format."
+           " After you can execute your SQL queries in usual manner.\n"
 
-        "There are two ways to define initial table keeping your data."
-        " Either just in first query like this:\n"
-        "    CREATE TABLE <table> (<structure>) ENGINE = File(<input-format>, <file>);\n"
-        "Either through corresponding command line parameters --table --structure --input-format and --file.";
+           "There are two ways to define initial table keeping your data."
+           " Either just in first query like this:\n"
+           "    CREATE TABLE <table> (<structure>) ENGINE = File(<input-format>, <file>);\n"
+           "Either through corresponding command line parameters --table --structure --input-format and --file.";
 }
 
 static std::string getHelpFooter()
 {
-    return
-        "Example printing memory used by each Unix user:\n"
-        "ps aux | tail -n +2 | awk '{ printf(\"%s\\t%s\\n\", $1, $4) }' | "
-        "clickhouse-local -S \"user String, mem Float64\" -q"
-            " \"SELECT user, round(sum(mem), 2) as mem_total FROM table GROUP BY user ORDER"
-            " BY mem_total DESC FORMAT PrettyCompact\"";
+    return "Example printing memory used by each Unix user:\n"
+           "ps aux | tail -n +2 | awk '{ printf(\"%s\\t%s\\n\", $1, $4) }' | "
+           "clickhouse-local -S \"user String, mem Float64\" -q"
+           " \"SELECT user, round(sum(mem), 2) as mem_total FROM table GROUP BY user ORDER"
+           " BY mem_total DESC FORMAT PrettyCompact\"";
 }
 
 void LocalServer::init(int argc, char ** argv)
@@ -519,31 +533,24 @@ void LocalServer::init(int argc, char ** argv)
     stopOptionsProcessing();
 
     po::options_description description = createOptionsDescription("Main options", getTerminalWidth());
-    description.add_options()
-        ("help", "produce help message")
-        ("config-file,c", po::value<std::string>(), "config-file path")
-        ("query,q", po::value<std::string>(), "query")
-        ("queries-file, qf", po::value<std::string>(), "file path with queries to execute")
-        ("database,d", po::value<std::string>(), "database")
+    description.add_options()("help", "produce help message")("config-file,c", po::value<std::string>(), "config-file path")(
+        "query,q", po::value<std::string>(), "query")("queries-file, qf", po::value<std::string>(), "file path with queries to execute")(
+        "database,d", po::value<std::string>(), "database")
 
         ("table,N", po::value<std::string>(), "name of the initial table")
         /// If structure argument is omitted then initial query is not generated
-        ("structure,S", po::value<std::string>(), "structure of the initial table (list of column and type names)")
-        ("file,f", po::value<std::string>(), "path to file with data of the initial table (stdin if not specified)")
-        ("input-format", po::value<std::string>(), "input format of the initial table data")
-        ("format,f", po::value<std::string>(), "default output format (clickhouse-client compatibility)")
-        ("output-format", po::value<std::string>(), "default output format")
+        ("structure,S", po::value<std::string>(), "structure of the initial table (list of column and type names)")(
+            "file,f", po::value<std::string>(), "path to file with data of the initial table (stdin if not specified)")(
+            "input-format", po::value<std::string>(), "input format of the initial table data")(
+            "format,f", po::value<std::string>(), "default output format (clickhouse-client compatibility)")(
+            "output-format", po::value<std::string>(), "default output format")
 
-        ("stacktrace", "print stack traces of exceptions")
-        ("echo", "print query before execution")
-        ("verbose", "print query and other debugging info")
-        ("logger.console", po::value<bool>()->implicit_value(true), "Log to console")
-        ("logger.log", po::value<std::string>(), "Log file name")
-        ("logger.level", po::value<std::string>(), "Log level")
-        ("ignore-error", "do not stop processing if a query failed")
-        ("no-system-tables", "do not attach system tables (better startup time)")
-        ("version,V", "print version information and exit")
-        ;
+            ("stacktrace",
+             "print stack traces of exceptions")("echo", "print query before execution")("verbose", "print query and other debugging info")(
+                "logger.console", po::value<bool>()->implicit_value(true), "Log to console")(
+                "logger.log", po::value<std::string>(), "Log file name")("logger.level", po::value<std::string>(), "Log level")(
+                "ignore-error", "do not stop processing if a query failed")(
+                "no-system-tables", "do not attach system tables (better startup time)")("version,V", "print version information and exit");
 
     cmd_settings.addProgramOptions(description);
 
@@ -617,6 +624,95 @@ void LocalServer::applyCmdOptions(Context & context)
 {
     context.setDefaultFormat(config().getString("output-format", config().getString("format", "TSV")));
     applyCmdSettings(context);
+}
+
+void LocalServer::writeProgress()
+{
+    if (!need_render_progress)
+        return;
+
+    /// Output all progress bar commands to stderr at once to avoid flicker.
+    WriteBufferFromFileDescriptor message(STDERR_FILENO, 1024);
+
+    static size_t increment = 0;
+    static const char * indicators[8] = {
+        "\033[1;30m→\033[0m",
+        "\033[1;31m↘\033[0m",
+        "\033[1;32m↓\033[0m",
+        "\033[1;33m↙\033[0m",
+        "\033[1;34m←\033[0m",
+        "\033[1;35m↖\033[0m",
+        "\033[1;36m↑\033[0m",
+        "\033[1m↗\033[0m",
+    };
+
+    const char * indicator = indicators[increment % 8];
+
+    size_t terminal_width = getTerminalWidth();
+
+    if (!written_progress_chars)
+    {
+        /// If the current line is not empty, the progress must be output on the next line.
+        /// The trick is found here: https://www.vidarholen.net/contents/blog/?p=878
+        message << std::string(terminal_width, ' ');
+    }
+    message << '\r';
+
+    size_t prefix_size = message.count();
+
+    message << indicator << " Progress: ";
+
+    message << formatReadableQuantity(progress.read_rows) << " rows, " << formatReadableSizeWithDecimalSuffix(progress.read_bytes);
+
+    size_t elapsed_ns = watch.elapsed();
+    if (elapsed_ns)
+        message << " (" << formatReadableQuantity(progress.read_rows * 1000000000.0 / elapsed_ns) << " rows/s., "
+                << formatReadableSizeWithDecimalSuffix(progress.read_bytes * 1000000000.0 / elapsed_ns) << "/s.) ";
+    else
+        message << ". ";
+
+    written_progress_chars = message.count() - prefix_size - (strlen(indicator) - 2); /// Don't count invisible output (escape sequences).
+
+    /// If the approximate number of rows to process is known, we can display a progress bar and percentage.
+    if (progress.total_rows_to_read > 0)
+    {
+        size_t total_rows_corrected = std::max(progress.read_rows, progress.total_rows_to_read);
+
+        /// To avoid flicker, display progress bar only if .5 seconds have passed since query execution start
+        ///  and the query is less than halfway done.
+
+        if (elapsed_ns > 500000000)
+        {
+            /// Trigger to start displaying progress bar. If query is mostly done, don't display it.
+            if (progress.read_rows * 2 < total_rows_corrected)
+                show_progress_bar = true;
+
+            if (show_progress_bar)
+            {
+                ssize_t width_of_progress_bar = static_cast<ssize_t>(terminal_width) - written_progress_chars - strlen(" 99%");
+                if (width_of_progress_bar > 0)
+                {
+                    std::string bar
+                        = UnicodeBar::render(UnicodeBar::getWidth(progress.read_rows, 0, total_rows_corrected, width_of_progress_bar));
+                    message << "\033[0;32m" << bar << "\033[0m";
+                    if (width_of_progress_bar > static_cast<ssize_t>(bar.size() / UNICODE_BAR_CHAR_SIZE))
+                        message << std::string(width_of_progress_bar - bar.size() / UNICODE_BAR_CHAR_SIZE, ' ');
+                }
+            }
+        }
+
+        /// Underestimate percentage a bit to avoid displaying 100%.
+        message << ' ' << (99 * progress.read_rows / total_rows_corrected) << '%';
+    }
+
+    message << CLEAR_TO_END_OF_LINE;
+    ++increment;
+
+    message.next();
+}
+void LocalServer::updateProgress(const Progress & value)
+{
+    this->progress.incrementPiecewiseAtomically(value);
 }
 
 }
